@@ -1,0 +1,197 @@
+// ---------------------------------------------------------
+// NXT Line Follower - PID Control
+//PID
+// BricxCC / NXC
+// ---------------------------------------------------------
+
+#define LEFT_MOTOR     OUT_B
+#define RIGHT_MOTOR    OUT_C
+#define BOTH_MOTORS    OUT_BC
+
+#define LIGHT_PORT     S3
+#define US_PORT        S4
+
+// ?????? ????????? (target) - ??? ????
+#define TARGET_LIGHT   47
+
+// ????? PID (?????? ?????? ???????)
+#define KP_TIMES_100   250   // Proportional: 2.50 (??? ????)
+#define KI_TIMES_100   12    // Integral: 0.12
+#define KD_TIMES_100   200   // Derivative: 2.00 (??????? ???)
+
+// ?????? ????????
+#define BASE_SPEED     100   // ???? ????? 100%!
+
+// ???? ???????
+#define WHEEL_DIAMETER_MM 56
+#define PI_TIMES_100      314
+#define MM_PER_DEGREE     ((PI_TIMES_100 * WHEEL_DIAMETER_MM) / 360)
+
+// ????? ?????? (??)
+#define STOP_DISTANCE_CM  8
+
+// ??????? PID ??????
+int lastError = 0;
+int integral = 0;
+
+int degreesToCm(int deg)
+{
+    int mm_times_100 = deg * MM_PER_DEGREE;
+    return mm_times_100 / 1000;
+}
+
+void setMotorPower(int L, int R)
+{
+    // ???? ?????? 100 ?????? ??????
+    if (L > 100) L = 100;
+    if (L < -20) L = -20;  // ???? ????? ????
+    if (R > 100) R = 100;
+    if (R < -20) R = -20;
+
+    if (L >= 0)
+        OnFwd(LEFT_MOTOR, L);
+    else
+        OnRev(LEFT_MOTOR, -L);
+
+    if (R >= 0)
+        OnFwd(RIGHT_MOTOR, R);
+    else
+        OnRev(RIGHT_MOTOR, -R);
+}
+
+int calculatePID(int currentLight)
+{
+    // ???? ????? (error)
+    int error = TARGET_LIGHT - currentLight;
+
+    // ???? Integral (????? ???????)
+    integral = integral + error;
+
+    // ??? integral ?? ????? ?????? (anti-windup)
+    if (integral > 1000) integral = 1000;
+    if (integral < -1000) integral = -1000;
+
+    // ???? Derivative (???? ???????)
+    int derivative = error - lastError;
+    lastError = error;
+
+    // ???? ??????? PID
+    // ???? ?? 100 ????? ?? ????? float
+    int P = (error * KP_TIMES_100) / 100;
+    int I = (integral * KI_TIMES_100) / 100;
+    int D = (derivative * KD_TIMES_100) / 100;
+
+    int correction = P + I + D;
+
+    return correction;
+}
+
+void followLine(long gStartTime)
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Following...");
+    TextOut(0, LCD_LINE2, "MAX SPEED!!!");
+
+    while (true)
+    {
+        // ??? ????? ??????
+        long elapsedMs = CurrentTick() - gStartTime;
+        int elapsedSec = elapsedMs / 1000;
+
+        ClearLine(LCD_LINE3);
+        TextOut(0, LCD_LINE3, "Time:");
+        NumOut(40, LCD_LINE3, elapsedSec);
+
+        // ??? ???????
+        int dist = SensorUS(US_PORT);
+
+        ClearLine(LCD_LINE4);
+        TextOut(0, LCD_LINE4, "Dist:");
+        NumOut(40, LCD_LINE4, dist);
+
+        if (dist > 0 && dist <= STOP_DISTANCE_CM)
+        {
+            Off(BOTH_MOTORS);
+
+            long elapsedMs  = CurrentTick() - gStartTime;
+            int elapsedSec  = elapsedMs / 1000;
+
+            int leftDeg  = MotorRotationCount(LEFT_MOTOR);
+            int rightDeg = MotorRotationCount(RIGHT_MOTOR);
+
+            int leftCm  = degreesToCm(leftDeg);
+            int rightCm = degreesToCm(rightDeg);
+            int avgCm   = (leftCm + rightCm) / 2;
+
+            ClearScreen();
+            TextOut(0, LCD_LINE1, "=== FINISHED ===");
+            TextOut(0, LCD_LINE2, "");
+            TextOut(0, LCD_LINE3, "Time (sec):");
+            NumOut(80, LCD_LINE3, elapsedSec);
+
+            TextOut(0, LCD_LINE4, "Dist (cm):");
+            NumOut(80, LCD_LINE4, avgCm);
+
+            TextOut(0, LCD_LINE5, "");
+            TextOut(0, LCD_LINE6, "Great job!");
+
+            PlayTone(1000, 50);
+            Wait(300);
+            PlayTone(1500, 50);
+            Wait(300);
+            PlayTone(2000, 100);
+
+            Wait(10000);
+            StopAllTasks();
+        }
+
+        // ????? ?????
+        int light = Sensor(LIGHT_PORT);
+
+        ClearLine(LCD_LINE5);
+        TextOut(0, LCD_LINE5, "L:");
+        NumOut(20, LCD_LINE5, light);
+
+        // ???? ??????? ???????? PID
+        int correction = calculatePID(light);
+
+        // ??? ??????? ??? ??????
+        ClearLine(LCD_LINE6);
+        TextOut(0, LCD_LINE6, "C:");
+        NumOut(20, LCD_LINE6, correction);
+
+        // ????? ??????? ??? ????????
+        // ??? correction ???? -> ??????? ??? ?????? -> ?? ????
+        // ??? correction ???? -> ??????? ??? ?????? -> ?? ????
+
+        // ???? ?????? ???? ?????? ???????
+        int leftP  = BASE_SPEED + correction;
+        int rightP = BASE_SPEED - correction;
+
+        setMotorPower(leftP, rightP);
+        Wait(2);  // ???? ??????? ?????!
+    }
+}
+
+task main()
+{
+    SetSensorLight(LIGHT_PORT);
+    SetSensorUltrasonic(US_PORT);
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Line Follower");
+    TextOut(0, LCD_LINE2, "MAX SPEED!!!");
+    TextOut(0, LCD_LINE3, "Press to start");
+    Wait(2000);
+
+    ResetRotationCount(LEFT_MOTOR);
+    ResetRotationCount(RIGHT_MOTOR);
+
+    // ????? ????? ??????? PID
+    lastError = 0;
+    integral = 0;
+
+    long gStartTime = CurrentTick();
+
+    followLine(gStartTime);
+}

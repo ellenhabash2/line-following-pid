@@ -1,0 +1,317 @@
+                       // NXT Line Follower - PID Control with Odometry
+
+#define LEFT_MOTOR     OUT_B
+#define RIGHT_MOTOR    OUT_C
+#define BOTH_MOTORS    OUT_BC
+
+#define LIGHT_PORT     S3
+#define US_PORT        S4
+
+// Target light value
+#define TARGET_LIGHT   47
+
+// PID constants
+#define KP_TIMES_100   250
+#define KI_TIMES_100   12
+#define KD_TIMES_100   200
+
+// Base speed
+#define BASE_SPEED     100
+
+// Robot dimensions
+#define WHEEL_DIAMETER_MM 56
+#define AXLE_LENGTH_MM    120
+#define PI_TIMES_100      314
+#define MM_PER_DEGREE     ((PI_TIMES_100 * WHEEL_DIAMETER_MM) / 360)
+
+// Stop distance
+#define STOP_DISTANCE_CM  8
+
+// PID variables
+int lastError = 0;
+int integral = 0;
+
+// Odometry variables
+float robotX = 0.0;
+float robotY = 0.0;
+float robotTheta = 0.0;
+long lastLeftDeg = 0;
+long lastRightDeg = 0;
+
+// File variables
+string dataFileName = "path2.txt";
+byte fileHandle;
+unsigned int fileSize = 0;
+
+string floatToStr(float value, int decimalPlaces)
+{
+    int intPart = value;
+    float fracPart = abs(value - intPart);
+
+    int multiplier = 1;
+    for (int i = 0; i < decimalPlaces; i++) {
+        multiplier *= 10;
+    }
+    int fracInt = fracPart * multiplier;
+
+    string result = NumToStr(intPart);
+    result = StrCat(result, ".");
+
+    string fracStr = NumToStr(fracInt);
+    int zerosNeeded = decimalPlaces - strlen(fracStr);
+    for (int i = 0; i < zerosNeeded; i++) {
+        fracStr = StrCat("0", fracStr);
+    }
+    result = StrCat(result, fracStr);
+
+    return result;
+}
+
+float degreesToMm(long deg)
+{
+    float circumference = (3.14159 * WHEEL_DIAMETER_MM);
+    return (deg * circumference) / 360.0;
+}
+
+int degreesToCm(int deg)
+{
+    int mm_times_100 = deg * MM_PER_DEGREE;
+    return mm_times_100 / 1000;
+}
+
+void openDataFile()
+{
+    DeleteFile(dataFileName);
+    unsigned int fileSize_temp = 10000;
+    byte result = CreateFile(dataFileName, fileSize_temp, fileHandle);
+
+    if (result == LDR_SUCCESS) {
+        string header = "Time,X,Y,Theta,Light,Dist\n";
+        WriteLnString(fileHandle, header, fileSize);
+    }
+}
+
+void saveDataPoint(long timeMs, int light, int distance)
+{
+    string xStr = floatToStr(robotX / 10.0, 2);
+    string yStr = floatToStr(robotY / 10.0, 2);
+    float thetaDeg = (robotTheta * 180.0) / 3.14159;
+    string thetaStr = floatToStr(thetaDeg, 2);
+
+    string line = "";
+    line = StrCat(line, NumToStr(timeMs));
+    line = StrCat(line, ",");
+    line = StrCat(line, xStr);
+    line = StrCat(line, ",");
+    line = StrCat(line, yStr);
+    line = StrCat(line, ",");
+    line = StrCat(line, thetaStr);
+    line = StrCat(line, ",");
+    line = StrCat(line, NumToStr(light));
+    line = StrCat(line, ",");
+    line = StrCat(line, NumToStr(distance));
+
+    WriteLnString(fileHandle, line, fileSize);
+}
+
+void closeDataFile()
+{
+    CloseFile(fileHandle);
+}
+
+void updateOdometry()
+{
+    long currentLeftDeg  = MotorRotationCount(LEFT_MOTOR);
+    long currentRightDeg = MotorRotationCount(RIGHT_MOTOR);
+
+    long deltaLeftDeg  = currentLeftDeg - lastLeftDeg;
+    long deltaRightDeg = currentRightDeg - lastRightDeg;
+
+    float deltaLeftMm  = degreesToMm(deltaLeftDeg);
+    float deltaRightMm = degreesToMm(deltaRightDeg);
+
+    float deltaDist = (deltaLeftMm + deltaRightMm) / 2.0;
+    float deltaTheta = (deltaRightMm - deltaLeftMm) / AXLE_LENGTH_MM;
+
+    if (abs(deltaTheta) < 0.001)
+    {
+        robotX += deltaDist * cos(robotTheta);
+        robotY += deltaDist * sin(robotTheta);
+    }
+    else
+    {
+        float radius = deltaDist / deltaTheta;
+        robotX += radius * (sin(robotTheta + deltaTheta) - sin(robotTheta));
+        robotY += radius * (-cos(robotTheta + deltaTheta) + cos(robotTheta));
+    }
+
+    robotTheta += deltaTheta;
+
+    while (robotTheta > 3.14159)  robotTheta -= 6.28318;
+    while (robotTheta < -3.14159) robotTheta += 6.28318;
+
+    lastLeftDeg  = currentLeftDeg;
+    lastRightDeg = currentRightDeg;
+}
+
+void setMotorPower(int L, int R)
+{
+    if (L > 100) L = 100;
+    if (L < -20) L = -20;
+    if (R > 100) R = 100;
+    if (R < -20) R = -20;
+
+    if (L >= 0)
+        OnFwd(LEFT_MOTOR, L);
+    else
+        OnRev(LEFT_MOTOR, -L);
+
+    if (R >= 0)
+        OnFwd(RIGHT_MOTOR, R);
+    else
+        OnRev(RIGHT_MOTOR, -R);
+}
+
+int calculatePID(int currentLight)
+{
+    int error = TARGET_LIGHT - currentLight;
+
+    integral = integral + error;
+
+    if (integral > 1000) integral = 1000;
+    if (integral < -1000) integral = -1000;
+
+    int derivative = error - lastError;
+    lastError = error;
+
+    int P = (error * KP_TIMES_100) / 100;
+    int I = (integral * KI_TIMES_100) / 100;
+    int D = (derivative * KD_TIMES_100) / 100;
+
+    int correction = P + I + D;
+
+    return correction;
+}
+
+void followLine(long gStartTime)
+{
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Following...");
+    TextOut(0, LCD_LINE2, "MAX SPEED!!!");
+
+    int updateCounter = 0;
+    int pointsSaved = 0;
+
+    while (true)
+    {
+        long elapsedMs = CurrentTick() - gStartTime;
+        int elapsedSec = elapsedMs / 1000;
+
+        int dist = SensorUS(US_PORT);
+        int light = Sensor(LIGHT_PORT);
+
+        updateOdometry();
+
+        updateCounter++;
+        if (updateCounter >= 5)
+        {
+            saveDataPoint(elapsedMs, light, dist);
+            pointsSaved++;
+            updateCounter = 0;
+        }
+
+        ClearLine(LCD_LINE3);
+        TextOut(0, LCD_LINE3, "Time:");
+        NumOut(40, LCD_LINE3, elapsedSec);
+
+        ClearLine(LCD_LINE4);
+        TextOut(0, LCD_LINE4, "Dist:");
+        NumOut(40, LCD_LINE4, dist);
+
+        if (dist > 0 && dist <= STOP_DISTANCE_CM)
+        {
+            Off(BOTH_MOTORS);
+
+            saveDataPoint(elapsedMs, light, dist);
+            pointsSaved++;
+            closeDataFile();
+
+            int leftDeg  = MotorRotationCount(LEFT_MOTOR);
+            int rightDeg = MotorRotationCount(RIGHT_MOTOR);
+
+            int leftCm  = degreesToCm(leftDeg);
+            int rightCm = degreesToCm(rightDeg);
+            int avgCm   = (leftCm + rightCm) / 2;
+
+            ClearScreen();
+            TextOut(0, LCD_LINE1, "=== FINISHED ===");
+            TextOut(0, LCD_LINE2, "Points:");
+            NumOut(50, LCD_LINE2, pointsSaved);
+            TextOut(0, LCD_LINE3, "Time (sec):");
+            NumOut(80, LCD_LINE3, elapsedSec);
+            TextOut(0, LCD_LINE4, "Dist (cm):");
+            NumOut(80, LCD_LINE4, avgCm);
+            TextOut(0, LCD_LINE5, "File saved!");
+
+            PlayTone(1000, 50);
+            Wait(300);
+            PlayTone(1500, 50);
+            Wait(300);
+            PlayTone(2000, 100);
+
+            Wait(10000);
+            StopAllTasks();
+        }
+
+        ClearLine(LCD_LINE5);
+        TextOut(0, LCD_LINE5, "L:");
+        NumOut(20, LCD_LINE5, light);
+
+        int correction = calculatePID(light);
+
+        ClearLine(LCD_LINE6);
+        TextOut(0, LCD_LINE6, "C:");
+        NumOut(20, LCD_LINE6, correction);
+
+        int leftP  = BASE_SPEED + correction;
+        int rightP = BASE_SPEED - correction;
+
+        setMotorPower(leftP, rightP);
+        Wait(2);
+    }
+}
+
+task main()
+{
+    SetSensorLight(LIGHT_PORT);
+    SetSensorUltrasonic(US_PORT);
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Line Follower");
+    TextOut(0, LCD_LINE2, "MAX SPEED!!!");
+    TextOut(0, LCD_LINE3, "Creating file...");
+    Wait(1000);
+
+    ResetRotationCount(LEFT_MOTOR);
+    ResetRotationCount(RIGHT_MOTOR);
+
+    lastError = 0;
+    integral = 0;
+
+    lastLeftDeg = 0;
+    lastRightDeg = 0;
+    robotX = 0.0;
+    robotY = 0.0;
+    robotTheta = 0.0;
+
+    openDataFile();
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Ready!");
+    TextOut(0, LCD_LINE2, "Starting...");
+    Wait(500);
+
+    long gStartTime = CurrentTick();
+
+    followLine(gStartTime);
+}

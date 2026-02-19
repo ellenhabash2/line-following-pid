@@ -1,0 +1,95 @@
+// ---------------------------------------------------------
+// NXT Line Follower - Window-Based
+// ---------------------------------------------------------
+#define LEFT_MOTOR     OUT_B
+#define RIGHT_MOTOR    OUT_C
+#define BOTH_MOTORS    OUT_BC
+#define LIGHT_PORT     S3
+#define US_PORT        S4
+
+int centerLow      = 42;
+int centerHigh     = 52;
+int veryDarkMax    = 38;
+int veryBrightMin  = 56;
+
+#define BASE_SPEED     90
+#define SMALL_TURN     12
+#define BIG_TURN       30
+#define EXTREME_TURN   50
+
+#define STOP_DISTANCE_CM  8
+
+void setMotorPower(int L, int R)
+{
+    if (L > 100) L = 100;
+    if (L < -100) L = -100;
+    if (R > 100) R = 100;
+    if (R < -100) R = -100;
+    if (L >= 0)
+        OnFwd(LEFT_MOTOR, L);
+    else
+        OnRev(LEFT_MOTOR, -L);
+    if (R >= 0)
+        OnFwd(RIGHT_MOTOR, R);
+    else
+        OnRev(RIGHT_MOTOR, -R);
+}
+
+void followLine()
+{
+    while (true)
+    {
+        int dist = SensorUS(US_PORT);
+        if (dist > 0 && dist <= STOP_DISTANCE_CM)
+        {
+            Off(BOTH_MOTORS);
+            PlayTone(1000, 50);
+            Wait(300);
+            PlayTone(1500, 50);
+            Wait(300);
+            Wait(8000);
+            StopAllTasks();
+        }
+
+        int light = Sensor(LIGHT_PORT);
+        int leftP  = BASE_SPEED;
+        int rightP = BASE_SPEED;
+
+        if (light <= veryDarkMax)
+        {
+            leftP  = BASE_SPEED + BIG_TURN;
+            rightP = BASE_SPEED - BIG_TURN;
+        }
+        else if (light < centerLow)
+        {
+            leftP  = BASE_SPEED + SMALL_TURN;
+            rightP = BASE_SPEED - SMALL_TURN;
+        }
+        else if (light > veryBrightMin)
+        {
+            leftP  = BASE_SPEED - BIG_TURN;
+            rightP = BASE_SPEED + BIG_TURN;
+        }
+        else if (light > centerHigh)
+        {
+            leftP  = BASE_SPEED - SMALL_TURN;
+            rightP = BASE_SPEED + SMALL_TURN;
+        }
+        else
+        {
+            leftP  = BASE_SPEED;
+            rightP = BASE_SPEED;
+        }
+
+        setMotorPower(leftP, rightP);
+        Wait(5);
+    }
+}
+
+task main()
+{
+    SetSensorLight(LIGHT_PORT);
+    SetSensorUltrasonic(US_PORT);
+
+    followLine();
+}

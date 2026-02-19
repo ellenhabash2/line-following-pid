@@ -1,0 +1,410 @@
+// ---------------------------------------------------------
+// NXT Line Follower - PID + Odometry Path Drawing (2-lap friendly)
+// For NXT 9797 with 56mm wheels
+// Slower, conservative turning, odometry each loop
+// BricxCC / NXC
+// ---------------------------------------------------------
+
+#define LEFT_MOTOR     OUT_B
+#define RIGHT_MOTOR    OUT_C
+#define BOTH_MOTORS    OUT_BC
+
+#define LIGHT_PORT     S3
+#define US_PORT        S4
+
+// PID target (gray on the line)
+#define TARGET_LIGHT   47
+
+// PID constants * 100
+#define KP_TIMES_100   250
+#define KI_TIMES_100   12
+#define KD_TIMES_100   200
+
+// Base forward speed (slower = less slip = better odometry)
+#define BASE_SPEED     80
+
+// ---- Wheel / geometry ----
+// Standard NXT wheel: diameter ~56mm
+#define WHEEL_DIAMETER_MM   56          // 5.6 cm
+#define WHEELBASE_MM        120         // distance between wheel centers (mm)
+#define PI_TIMES_100        314         // 3.14 * 100
+
+// distance per degree in mm * 100
+// mm_per_deg ˜ 3.14*56/360 ˜ 0.488 mm ? *100 ˜ 49
+#define MM_PER_DEGREE_TIMES_100  49
+
+// factor to convert (?sR - ?sL)/wheelbase into deg*100
+// 180/pi * 100 ˜ 5729
+#define THETA_FACTOR_NUM   5729
+
+// extra gain to compensate slip & approximations
+// 100 = theoretical; keep close to 100 to avoid over/under turning
+#define TURN_GAIN_PERCENT  100
+
+// Stop distance (cm)
+#define STOP_DISTANCE_CM   8
+
+// Screen / path
+#define MAX_PATH_POINTS    500
+#define SCREEN_WIDTH       100
+#define SCREEN_HEIGHT      64
+
+// ---- PID state ----
+int lastError = 0;
+int integral  = 0;
+
+// ---- Odometry state ----
+// positions stored as mm * 10
+int posX[MAX_PATH_POINTS];
+int posY[MAX_PATH_POINTS];
+int pathCount = 0;
+
+int currentX     = 0;   // mm * 10
+int currentY     = 0;   // mm * 10
+int currentTheta = 0;   // degrees * 100
+
+// ---- Trig lookup tables ----
+// sin / cos for 0..359 degrees, each value * 1000
+int sinTable[360];
+int cosTable[360];
+
+// ---------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------
+
+// Clear one LCD text line
+void ClearLCDLine(byte line)
+{
+    TextOut(0, line, "                    ");
+}
+
+// Initialize rough trig tables (for path drawing only)
+void initTrigTables()
+{
+    int i;
+    for (i = 0; i < 360; i++)
+    {
+        if (i >= 0 && i < 90)
+        {
+            sinTable[i] = i * 11;
+            cosTable[i] = 1000 - i * 11;
+        }
+        else if (i >= 90 && i < 180)
+        {
+            sinTable[i] = 1000 - (i - 90) * 11;
+            cosTable[i] = -((i - 90) * 11);
+        }
+        else if (i >= 180 && i < 270)
+        {
+            sinTable[i] = -((i - 180) * 11);
+            cosTable[i] = -1000 + (i - 180) * 11;
+        }
+        else
+        {
+            sinTable[i] = -1000 + (i - 270) * 11;
+            cosTable[i] = (i - 270) * 11;
+        }
+    }
+}
+
+int getSin(int angleDeg100)
+{
+    int ang = angleDeg100 / 100;
+    while (ang >= 360) ang -= 360;
+    while (ang < 0)    ang += 360;
+    return sinTable[ang];
+}
+
+int getCos(int angleDeg100)
+{
+    int ang = angleDeg100 / 100;
+    while (ang >= 360) ang -= 360;
+    while (ang < 0)    ang += 360;
+    return cosTable[ang];
+}
+
+// Convert motor degrees to mm
+int degreesToMm(int deg)
+{
+    // deg * 0.488mm ˜ deg*49/100
+    return (deg * MM_PER_DEGREE_TIMES_100) / 100;
+}
+
+// Clamp and control motors
+void setMotorPower(int L, int R)
+{
+    if (L > 100) L = 100;
+    if (L < -20) L = -20;
+    if (R > 100) R = 100;
+    if (R < -20) R = -20;
+
+    if (L >= 0)
+        OnFwd(LEFT_MOTOR, L);
+    else
+        OnRev(LEFT_MOTOR, -L);
+
+    if (R >= 0)
+        OnFwd(RIGHT_MOTOR, R);
+    else
+        OnRev(RIGHT_MOTOR, -R);
+}
+
+// PID computation
+int calculatePID(int currentLight)
+{
+    int error = TARGET_LIGHT - currentLight;
+    integral += error;
+
+    if (integral > 1000)  integral = 1000;
+    if (integral < -1000) integral = -1000;
+
+    int derivative = error - lastError;
+    lastError = error;
+
+    int P = (error      * KP_TIMES_100) / 100;
+    int I = (integral   * KI_TIMES_100) / 100;
+    int D = (derivative * KD_TIMES_100) / 100;
+
+    return P + I + D;
+}
+
+// ---------------------------------------------------------
+// Odometry (mid-angle variant, every loop)
+// ---------------------------------------------------------
+
+void updateOdometry(int leftDeg, int rightDeg, int prevLeftDeg, int prevRightDeg)
+{
+    int leftDelta  = leftDeg  - prevLeftDeg;
+    int rightDelta = rightDeg - prevRightDeg;
+
+    int distLeft   = degreesToMm(leftDelta);   // mm
+    int distRight  = degreesToMm(rightDelta);  // mm
+
+    int distCenter = (distLeft + distRight) / 2;   // mm
+    int distDiff   = distRight - distLeft;         // mm
+
+    // heading change in deg*100, with gain factor
+    int deltaTheta = (distDiff * THETA_FACTOR_NUM * TURN_GAIN_PERCENT)
+                     / (WHEELBASE_MM * 100);
+
+    // use mid-angle for position update
+    int thetaMid = currentTheta + (deltaTheta / 2);
+
+    // update final heading
+    currentTheta += deltaTheta;
+
+    // normalize to [0, 36000)
+    while (currentTheta >= 36000) currentTheta -= 36000;
+    while (currentTheta < 0)      currentTheta += 36000;
+
+    // position in mm*10  (distCenter*1000/100 = mm*10)
+    currentX += (distCenter * getCos(thetaMid)) / 100;
+    currentY += (distCenter * getSin(thetaMid)) / 100;
+}
+
+void recordPosition()
+{
+    if (pathCount < MAX_PATH_POINTS)
+    {
+        posX[pathCount] = currentX;   // mm*10
+        posY[pathCount] = currentY;   // mm*10
+        pathCount++;
+    }
+}
+
+// ---------------------------------------------------------
+// Draw final path on LCD
+// ---------------------------------------------------------
+
+void drawFinalPath()
+{
+    int i;
+
+    if (pathCount < 2) return;
+
+    ClearScreen();
+
+    // Find min/max
+    int minX = posX[0];
+    int maxX = posX[0];
+    int minY = posY[0];
+    int maxY = posY[0];
+
+    for (i = 1; i < pathCount; i++)
+    {
+        if (posX[i] < minX) minX = posX[i];
+        if (posX[i] > maxX) maxX = posX[i];
+        if (posY[i] < minY) minY = posY[i];
+        if (posY[i] > maxY) maxY = posY[i];
+    }
+
+    int rangeX = maxX - minX;
+    int rangeY = maxY - minY;
+
+    if (rangeX < 100) rangeX = 100;
+    if (rangeY < 100) rangeY = 100;
+
+    // posX/posY are mm*10 ? divide by 10 to get mm
+    int scaleX = ((SCREEN_WIDTH  - 10) * 1000) / (rangeX / 10);
+    int scaleY = ((SCREEN_HEIGHT - 10) * 1000) / (rangeY / 10);
+
+    int scale = scaleX;
+    if (scaleY < scale) scale = scaleY;
+
+    int prevScreenX = 0;
+    int prevScreenY = 0;
+
+    // Draw path
+    for (i = 0; i < pathCount; i++)
+    {
+        int screenX = (((posX[i] - minX) / 10) * scale) / 1000 + 5;
+        int screenY = (((posY[i] - minY) / 10) * scale) / 1000 + 5;
+
+        if (screenX < 0)              screenX = 0;
+        if (screenX >= SCREEN_WIDTH)  screenX = SCREEN_WIDTH  - 1;
+        if (screenY < 0)              screenY = 0;
+        if (screenY >= SCREEN_HEIGHT) screenY = SCREEN_HEIGHT - 1;
+
+        PointOut(screenX, screenY);
+
+        if (i > 0)
+        {
+            LineOut(prevScreenX, prevScreenY, screenX, screenY);
+        }
+
+        prevScreenX = screenX;
+        prevScreenY = screenY;
+    }
+
+    // Mark start point
+    {
+        int startX = (((posX[0] - minX) / 10) * scale) / 1000 + 5;
+        int startY = (((posY[0] - minY) / 10) * scale) / 1000 + 5;
+
+        if (startX < 0)              startX = 0;
+        if (startX >= SCREEN_WIDTH)  startX = SCREEN_WIDTH  - 1;
+        if (startY < 0)              startY = 0;
+        if (startY >= SCREEN_HEIGHT) startY = SCREEN_HEIGHT - 1;
+
+        CircleOut(startX, startY, 3);
+    }
+}
+
+// ---------------------------------------------------------
+// Line following loop
+// ---------------------------------------------------------
+
+void followLine(long gStartTime)
+{
+    int prevLeftDeg  = 0;
+    int prevRightDeg = 0;
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Following...");
+
+    while (true)
+    {
+        int dist = SensorUS(US_PORT);
+
+        long elapsedMs = CurrentTick() - gStartTime;
+        int elapsedSec = elapsedMs / 1000;
+
+        // Line 2: Time & Distance
+        ClearLCDLine(LCD_LINE2);
+        TextOut(0,  LCD_LINE2, "T:");
+        NumOut(15,  LCD_LINE2, elapsedSec);
+        TextOut(50, LCD_LINE2, "D:");
+        NumOut(65, LCD_LINE2, dist);
+
+        // Stop if close enough
+        if (dist > 0 && dist <= STOP_DISTANCE_CM)
+        {
+            int leftDeg  = MotorRotationCount(LEFT_MOTOR);
+            int rightDeg = MotorRotationCount(RIGHT_MOTOR);
+
+            updateOdometry(leftDeg, rightDeg, prevLeftDeg, prevRightDeg);
+            recordPosition();
+
+            Off(BOTH_MOTORS);
+
+            ClearScreen();
+            TextOut(0, LCD_LINE1, "=== FINISHED ===");
+            TextOut(0, LCD_LINE2, "Points:");
+            NumOut(50, LCD_LINE2, pathCount);
+            TextOut(0, LCD_LINE3, "Drawing path...");
+
+            PlayTone(1000, 50); Wait(300);
+            PlayTone(1500, 50); Wait(300);
+            PlayTone(2000, 100);
+
+            Wait(2000);
+
+            drawFinalPath();
+
+            Wait(20000);
+            StopAllTasks();
+        }
+
+        // Line following with PID
+        int light = Sensor(LIGHT_PORT);
+
+        // Line 3: Light & PathCount
+        ClearLCDLine(LCD_LINE3);
+        TextOut(0,  LCD_LINE3, "L:");
+        NumOut(15,  LCD_LINE3, light);
+        TextOut(50, LCD_LINE3, "P:");
+        NumOut(65, LCD_LINE3, pathCount);
+
+        int correction = calculatePID(light);
+
+        int leftP  = BASE_SPEED + correction;
+        int rightP = BASE_SPEED - correction;
+        setMotorPower(leftP, rightP);
+
+        // --- Odometry update EVERY LOOP ---
+        {
+            int leftDeg  = MotorRotationCount(LEFT_MOTOR);
+            int rightDeg = MotorRotationCount(RIGHT_MOTOR);
+
+            updateOdometry(leftDeg, rightDeg, prevLeftDeg, prevRightDeg);
+            recordPosition();
+
+            prevLeftDeg  = leftDeg;
+            prevRightDeg = rightDeg;
+        }
+
+        Wait(2);
+    }
+}
+
+// ---------------------------------------------------------
+// main
+// ---------------------------------------------------------
+
+task main()
+{
+    SetSensorLight(LIGHT_PORT);
+    SetSensorUltrasonic(US_PORT);
+
+    initTrigTables();
+
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "Line Follower");
+    TextOut(0, LCD_LINE2, "Odom 2-Laps");
+    TextOut(0, LCD_LINE3, "Press to start");
+    Wait(2000);
+
+    ResetRotationCount(LEFT_MOTOR);
+    ResetRotationCount(RIGHT_MOTOR);
+
+    lastError    = 0;
+    integral     = 0;
+    pathCount    = 0;
+    currentX     = 0;
+    currentY     = 0;
+    currentTheta = 0;
+
+    long gStartTime = CurrentTick();
+
+    followLine(gStartTime);
+}
